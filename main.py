@@ -191,6 +191,9 @@ STREAMLINK_VERSION_TIMEOUT_SECONDS = 5.0
 MIN_STREAMLINK_VERSION = (8, 2, 1)
 MIN_STREAMLINK_VERSION_TEXT = ".".join(str(part) for part in MIN_STREAMLINK_VERSION)
 CHAT_SOCKET_TIMEOUT_SECONDS = 2.0
+CHAT_RECONNECT_BASE_SECONDS = 1.0
+CHAT_RECONNECT_MAX_SECONDS = 30.0
+CHAT_STABLE_RESET_SECONDS = 60.0
 CHAT_SEND_CONFIRM_SECONDS = 20.0
 ONLINE_STATUS_REFRESH_SECONDS = 300
 EXPLORE_CACHE_SECONDS = 120
@@ -383,12 +386,19 @@ def _is_executable_file(path: Path) -> bool:
 
 
 def resolve_command(command: str) -> str | None:
+    # PyInstaller one-file apps unpack bundled tools into _MEIPASS.  Keep the
+    # executable directory as a second location for one-folder/dev builds.
+    bundle_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     executable_dir = Path(sys.executable).absolute().parent
     names = (f"{command}.exe", f"{command}.cmd", f"{command}.bat", command) if sys.platform.startswith("win") else (command,)
-    for name in names:
-        candidate = executable_dir / name
-        if _is_executable_file(candidate):
-            return str(candidate)
+    for directory in (bundle_dir, executable_dir):
+        for name in names:
+            candidate = directory / "bin" / name
+            if _is_executable_file(candidate):
+                return str(candidate)
+            candidate = directory / name
+            if _is_executable_file(candidate):
+                return str(candidate)
     return shutil.which(command)
 
 
@@ -3212,64 +3222,111 @@ class TwitchChatReader:
         self.send_lock = threading.Lock()
 
     def run(self) -> None:
-        sock: ssl.SSLSocket | None = None
-        try:
-            context = ssl.create_default_context()
-            raw_sock = socket.create_connection((TWITCH_IRC_HOST, TWITCH_IRC_PORT), timeout=10)
-            sock = context.wrap_socket(raw_sock, server_hostname=TWITCH_IRC_HOST)
-            self.sock = sock
-            sock.settimeout(CHAT_SOCKET_TIMEOUT_SECONDS)
+        reconnect_delay = CHAT_RECONNECT_BASE_SECONDS
+        announced_reconnect = False
 
-            self._send(f"PASS {self.token}")
-            self._send(f"NICK {self.nick}")
-            self._send("CAP REQ :twitch.tv/tags twitch.tv/commands")
-            self._send(f"JOIN #{self.channel}")
-            self.event_queue.put(("chat_status", f"Connected to #{self.channel}"))
+        while not self.stop_event.is_set():
+            sock: ssl.SSLSocket | None = None
+            connected_at = 0.0
+            reconnect_requested = False
+            auth_failed = False
+            try:
+                context = ssl.create_default_context()
+                raw_sock = socket.create_connection((TWITCH_IRC_HOST, TWITCH_IRC_PORT), timeout=10)
+                sock = context.wrap_socket(raw_sock, server_hostname=TWITCH_IRC_HOST)
+                self.sock = sock
+                sock.settimeout(CHAT_SOCKET_TIMEOUT_SECONDS)
 
-            buffer = ""
-            while not self.stop_event.is_set():
-                try:
-                    chunk = sock.recv(4096)
-                except socket.timeout:
-                    continue
+                self._send(f"PASS {self.token}")
+                self._send(f"NICK {self.nick}")
+                self._send("CAP REQ :twitch.tv/tags twitch.tv/commands")
+                self._send(f"JOIN #{self.channel}")
+                connected_at = time.monotonic()
+                self.event_queue.put(("chat_status", f"Connected to #{self.channel}"))
+                announced_reconnect = False
 
-                if not chunk:
-                    break
-
-                buffer += chunk.decode("utf-8", errors="replace")
-                lines = buffer.split("\r\n")
-                buffer = lines.pop()
-
-                for line in lines:
-                    if not line:
+                buffer = ""
+                while not self.stop_event.is_set():
+                    try:
+                        chunk = sock.recv(4096)
+                    except socket.timeout:
                         continue
-                    if line.startswith("PING"):
-                        self._send(line.replace("PING", "PONG", 1))
-                        continue
-                    parsed = parse_privmsg(line)
-                    if parsed:
-                        user, message = parsed
-                        clean_user = sanitize_chat_user(user)
-                        clean_message = sanitize_chat_message(message)
-                        if clean_message:
-                            self.event_queue.put(("chat_message", json.dumps({"user": clean_user, "message": clean_message})))
-                    elif "Login authentication failed" in line:
-                        self.event_queue.put(("chat_status", "Chat auth failed. Check Settings."))
-                        return
-                    elif " NOTICE " in line and " :" in line:
-                        self.event_queue.put(("chat_status", "Chat notice: " + line.rsplit(" :", 1)[-1]))
-        except Exception as exc:
-            if not self.stop_event.is_set():
-                self.event_queue.put(("chat_status", f"Chat disconnected: {exc}"))
-        finally:
-            if sock:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-            self.sock = None
-            if not self.stop_event.is_set():
-                self.event_queue.put(("chat_status", "Chat disconnected."))
+
+                    if not chunk:
+                        raise ConnectionError("Twitch chat closed the connection.")
+
+                    buffer += chunk.decode("utf-8", errors="replace")
+                    lines = buffer.split("\r\n")
+                    buffer = lines.pop()
+
+                    for line in lines:
+                        if not line:
+                            continue
+                        if line.startswith("PING"):
+                            self._send(line.replace("PING", "PONG", 1))
+                            continue
+                        if line == "RECONNECT" or line.endswith(" RECONNECT"):
+                            reconnect_requested = True
+                            raise ConnectionError("Twitch requested chat reconnection.")
+
+                        parsed = parse_privmsg(line)
+                        if parsed:
+                            user, message = parsed
+                            clean_user = sanitize_chat_user(user)
+                            clean_message = sanitize_chat_message(message)
+                            if clean_message:
+                                self.event_queue.put(
+                                    ("chat_message", json.dumps({"user": clean_user, "message": clean_message}))
+                                )
+                        elif "Login authentication failed" in line:
+                            auth_failed = True
+                            self.event_queue.put(("chat_status", "Chat auth failed. Check Settings."))
+                            return
+                        elif " NOTICE " in line and " :" in line:
+                            notice = sanitize_text(line.rsplit(" :", 1)[-1], max_chars=300)
+                            self.event_queue.put(("chat_status", "Chat notice: " + notice))
+            except Exception as exc:
+                if not self.stop_event.is_set() and not auth_failed:
+                    reason = "Twitch requested reconnect." if reconnect_requested else redact_sensitive_text(exc, 180)
+                    self.event_queue.put(("chat_status", f"Chat connection lost: {reason}"))
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                if self.sock is sock:
+                    self.sock = None
+
+            if self.stop_event.is_set() or auth_failed:
+                break
+
+            if connected_at and time.monotonic() - connected_at >= CHAT_STABLE_RESET_SECONDS:
+                reconnect_delay = CHAT_RECONNECT_BASE_SECONDS
+
+            wait_seconds = 0.2 if reconnect_requested else reconnect_delay
+            if not announced_reconnect:
+                self.event_queue.put(("chat_status", f"Reconnecting chat in {wait_seconds:.1f}s..."))
+                announced_reconnect = True
+            if self.stop_event.wait(wait_seconds):
+                break
+            reconnect_delay = min(reconnect_delay * 2.0, CHAT_RECONNECT_MAX_SECONDS)
+
+        self.sock = None
+
+    def close(self) -> None:
+        self.stop_event.set()
+        sock = self.sock
+        self.sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def send_chat_message(self, message: str) -> bool:
         message = sanitize_chat_message(message)
@@ -3332,6 +3389,8 @@ class TwitchFreedomApp(ctk.CTk):
         self.diagnostics_visible = False
         self.chat_line_count = 0
         self.fullscreen_video = False
+        self.closing = False
+        self.event_poll_after_id: str | None = None
 
         self.title("Twitch Freedom Command Deck")
         self.geometry("1180x760")
@@ -3342,7 +3401,7 @@ class TwitchFreedomApp(ctk.CTk):
         self._build_ui()
         self.refresh_history()
         self.log("Encrypted history vault unlocked.")
-        self.after(EVENT_POLL_IDLE_MS, self.process_events)
+        self.event_poll_after_id = self.after(EVENT_POLL_IDLE_MS, self.process_events)
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(1, weight=1)
@@ -3936,8 +3995,11 @@ class TwitchFreedomApp(ctk.CTk):
         return True
 
     def disconnect_chat(self, user_requested: bool) -> None:
+        reader = self.chat_reader
         if self.chat_stop_event:
             self.chat_stop_event.set()
+        if reader is not None:
+            reader.close()
         self.chat_stop_event = None
         self.chat_thread = None
         self.chat_reader = None
@@ -4193,19 +4255,28 @@ class TwitchFreedomApp(ctk.CTk):
             quality,
         ]
 
+    def _ffplay_live_input_options(self) -> list[str]:
+        return [
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-analyzeduration",
+            "10M",
+            "-probesize",
+            "10M",
+            "-max_probe_packets",
+            "10000",
+        ]
+
     def _ffplay_command(self, volume: float) -> list[str]:
         return [
             resolve_command("ffplay") or "ffplay",
             "-autoexit",
             "-nodisp",
-            "-f",
-            "mpegts",
+            *self._ffplay_live_input_options(),
             "-af",
             f"volume={volume:.1f}",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
+            "-sync",
+            "ext",
             "-",
         ]
 
@@ -4215,14 +4286,12 @@ class TwitchFreedomApp(ctk.CTk):
             "-autoexit",
             "-window_title",
             window_title,
-            "-f",
-            "mpegts",
+            *self._ffplay_live_input_options(),
             "-af",
             f"volume={volume:.1f}",
-            "-fflags",
-            "nobuffer",
-            "-flags",
-            "low_delay",
+            "-sync",
+            "ext",
+            "-framedrop",
             "-",
         ]
 
@@ -4923,6 +4992,8 @@ class TwitchFreedomApp(ctk.CTk):
         threading.Thread(target=self.monitor_stream, args=(self.video_last_url,), daemon=True).start()
 
     def process_events(self) -> None:
+        if self.closing:
+            return
         processed = 0
         try:
             while processed < MAX_EVENTS_PER_TICK:
@@ -4996,7 +5067,8 @@ class TwitchFreedomApp(ctk.CTk):
             pass
         expired_sends = self.poll_pending_chat_sends()
         next_poll_ms = EVENT_POLL_ACTIVE_MS if processed or expired_sends or self.pending_chat_sends else EVENT_POLL_IDLE_MS
-        self.after(next_poll_ms, self.process_events)
+        if not self.closing:
+            self.event_poll_after_id = self.after(next_poll_ms, self.process_events)
 
     def load_record(self, record: StreamRecord) -> None:
         self.suppress_volume_restart = True
@@ -5045,14 +5117,1105 @@ class TwitchFreedomApp(ctk.CTk):
         messagebox.showinfo("Password changed", "Saved streams were re-encrypted with the new password.")
 
     def on_close(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
+        # Cancel every callback owned by the application before Tcl widgets
+        # are destroyed. This prevents stale Python command names from being
+        # invoked by Tk after the window has already gone away.
+        callback_ids = (
+            self.event_poll_after_id,
+            self.chat_flush_after_id,
+            self.playback_restart_after_id,
+            self.volume_restart_after_id,
+            self.video_restart_after_id,
+            getattr(self, "indicator_after_id", None),
+        )
+        for callback_id in callback_ids:
+            if callback_id is not None:
+                try:
+                    self.after_cancel(callback_id)
+                except tk.TclError:
+                    pass
+        self.event_poll_after_id = None
+        self.indicator_after_id = None
         if self.chat_flush_after_id is not None:
-            self.after_cancel(self.chat_flush_after_id)
             self.chat_flush_after_id = None
         self.flush_chat_saves()
         self.disconnect_chat(user_requested=False)
         self.stop_stream(user_requested=False)
         self.history.close()
+        self.quit()
         self.destroy()
+
+
+
+# ---------------------------------------------------------------------------
+# Twitch Freedom UI v3: reliable zero-width drawer + theme contrast controls.
+# ---------------------------------------------------------------------------
+UI_PREFS_KEY = "twitchfreedom_ui_preferences_v3"
+THEME_PALETTES: dict[str, dict[str, str]] = {
+    "Midnight Glass": {
+        "root": "#07090f", "surface": "#101522", "surface_alt": "#151c2d", "panel": "#0b0f19",
+        "border": "#263653", "text": "#f7f9ff", "muted": "#8d98b3", "accent": "#4da3ff",
+        "accent_hover": "#78b9ff", "success": "#63f2c6", "danger": "#ff5f7a", "danger_hover": "#ff7f94",
+        "warning": "#ffbd70",
+    },
+    "Solar Graphite": {
+        "root": "#090909", "surface": "#151515", "surface_alt": "#202020", "panel": "#0e0e0e",
+        "border": "#343434", "text": "#fafafa", "muted": "#a5a5a5", "accent": "#f3a712",
+        "accent_hover": "#ffc857", "success": "#54e3a4", "danger": "#ff6b6b", "danger_hover": "#ff8d8d",
+        "warning": "#ffd166",
+    },
+    "Aurora Violet": {
+        "root": "#080711", "surface": "#151126", "surface_alt": "#21183b", "panel": "#0e0b19",
+        "border": "#493b72", "text": "#fbf9ff", "muted": "#aaa0c3", "accent": "#8f6cff",
+        "accent_hover": "#ad94ff", "success": "#62efc4", "danger": "#ff6f91", "danger_hover": "#ff91aa",
+        "warning": "#ffd078",
+    },
+    "Arctic Light": {
+        "root": "#edf2f7", "surface": "#ffffff", "surface_alt": "#e6edf5", "panel": "#f7f9fc",
+        "border": "#c8d3e0", "text": "#111827", "muted": "#5f6b7a", "accent": "#1473e6",
+        "accent_hover": "#3b8df0", "success": "#0f9f6e", "danger": "#d9415d", "danger_hover": "#e56379",
+        "warning": "#b86b00",
+    },
+}
+
+
+def _hex_rgb(value: str) -> tuple[int, int, int]:
+    value = str(value or "").strip().lstrip("#")
+    if len(value) == 3:
+        value = "".join(ch * 2 for ch in value)
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
+        return 0, 0, 0
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _relative_luminance(value: str) -> float:
+    channels = []
+    for channel in _hex_rgb(value):
+        scaled = channel / 255.0
+        channels.append(scaled / 12.92 if scaled <= 0.04045 else ((scaled + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast_text(background: str) -> str:
+    luminance = _relative_luminance(background)
+    white_ratio = 1.05 / (luminance + 0.05)
+    black_ratio = (luminance + 0.05) / 0.05
+    return "#ffffff" if white_ratio >= black_ratio else "#08111f"
+
+
+def _load_v3_preferences(history: EncryptedHistoryStore) -> dict[str, Any]:
+    stored = history.get_secret_setting(UI_PREFS_KEY) or {}
+    theme = sanitize_text(stored.get("theme"), max_chars=80)
+    return {
+        "theme": theme if theme in THEME_PALETTES else "Midnight Glass",
+        "show_stream_titles": bool(stored.get("show_stream_titles", True)),
+        "sidebar_collapsed": bool(stored.get("sidebar_collapsed", False)),
+    }
+
+
+def _save_v3_preferences(app: "TwitchFreedomApp") -> None:
+    app.history.set_secret_setting(
+        UI_PREFS_KEY,
+        {
+            "theme": app.theme_name,
+            "show_stream_titles": bool(app.show_stream_titles),
+            "sidebar_collapsed": bool(app.sidebar_collapsed),
+        },
+    )
+
+
+class V3StreamCard(ctk.CTkFrame):
+    def __init__(
+        self,
+        master: ctk.CTkFrame,
+        record: StreamRecord,
+        app: "TwitchFreedomApp",
+        compact: bool = False,
+        online_status: bool | None = None,
+    ) -> None:
+        p = app.palette
+        super().__init__(
+            master,
+            fg_color=p["surface_alt"],
+            corner_radius=14,
+            border_width=1,
+            border_color=p["border"],
+        )
+        self.record = record
+        self.app = app
+
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=12, pady=(12, 2))
+        status_color = p["success"] if online_status is True else p["muted"]
+        ctk.CTkLabel(header, text="●" if online_status is True else "○", width=14, text_color=status_color).pack(
+            side="left", padx=(0, 5)
+        )
+        title = record.title if app.show_stream_titles else channel_name_from_url(record.url)
+        ctk.CTkLabel(
+            header,
+            text=title,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color=p["text"],
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+
+        ctk.CTkLabel(
+            self,
+            text=f"{record.quality} | {record.volume:.1f}x | {record.play_count} plays",
+            font=ctk.CTkFont(size=10),
+            text_color=p["muted"],
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 9))
+
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(fill="x", padx=10, pady=(0, 11))
+        accent_text = _contrast_text(p["accent"])
+        danger_text = _contrast_text(p["danger"])
+        ctk.CTkButton(
+            row,
+            text="Play",
+            width=54,
+            height=29,
+            fg_color=p["accent"],
+            hover_color=p["accent_hover"],
+            text_color=accent_text,
+            text_color_disabled=p["muted"],
+            state="disabled" if online_status is False else "normal",
+            command=lambda: app.play_record(record),
+        ).pack(side="left", padx=(0, 7))
+        ctk.CTkButton(
+            row,
+            text="Load",
+            width=54,
+            height=29,
+            fg_color=p["surface"],
+            hover_color=p["border"],
+            text_color=p["text"],
+            command=lambda: app.load_record(record),
+        ).pack(side="left", padx=(0, 7))
+        ctk.CTkButton(
+            row,
+            text="Delete",
+            width=62,
+            height=29,
+            fg_color=p["danger"],
+            hover_color=p["danger_hover"],
+            text_color=danger_text,
+            command=lambda: app.delete_record(record),
+        ).pack(side="right")
+
+
+class V3HelpDialog(ctk.CTkToplevel):
+    def __init__(self, app: "TwitchFreedomApp") -> None:
+        super().__init__(app)
+        p = app.palette
+        self.title("Twitch Freedom Help")
+        self.geometry("720x650")
+        self.minsize(620, 520)
+        self.configure(fg_color=p["root"])
+        shell = ctk.CTkScrollableFrame(
+            self, fg_color=p["surface"], corner_radius=22, border_width=1, border_color=p["border"]
+        )
+        shell.pack(fill="both", expand=True, padx=18, pady=18)
+        ctk.CTkLabel(
+            shell, text="Help Center", font=ctk.CTkFont(size=28, weight="bold"), text_color=p["text"]
+        ).pack(anchor="w", padx=20, pady=(20, 4))
+        sections = (
+            ("Quick start", "Use + to reveal the secure Twitch URL field, paste an HTTPS twitch.tv channel, choose Audio or Video, then press Start."),
+            ("Windows", "Install Python 3.11+, FFmpeg/FFplay, and Streamlink. Then install requirements.txt and run: python main.py"),
+            ("macOS", "Install Python 3.11+, FFmpeg, and Streamlink with Homebrew, then run: python3 main.py"),
+            ("Linux / ChromeOS", "Install python3-tk, ffmpeg, and Streamlink. On X11, FFplay docks inside the video surface."),
+            ("Privacy", "The vault password is never stored. Twitch tokens, preferences, saved streams, and chat history use authenticated AES-GCM encryption."),
+        )
+        for title, body in sections:
+            card = ctk.CTkFrame(shell, fg_color=p["surface_alt"], corner_radius=16, border_width=1, border_color=p["border"])
+            card.pack(fill="x", padx=20, pady=7)
+            ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=16, weight="bold"), text_color=p["text"]).pack(
+                anchor="w", padx=16, pady=(14, 5)
+            )
+            ctk.CTkLabel(
+                card, text=body, text_color=p["muted"], wraplength=620, justify="left", anchor="w"
+            ).pack(fill="x", padx=16, pady=(0, 14))
+
+
+class V3ControlCenter(ctk.CTkToplevel):
+    def __init__(self, app: "TwitchFreedomApp") -> None:
+        super().__init__(app)
+        self.app = app
+        p = app.palette
+        self.title("Twitch Freedom Control Center")
+        self.geometry("650x650")
+        self.minsize(570, 540)
+        self.configure(fg_color=p["root"])
+        shell = ctk.CTkScrollableFrame(
+            self, fg_color=p["surface"], corner_radius=22, border_width=1, border_color=p["border"]
+        )
+        shell.pack(fill="both", expand=True, padx=18, pady=18)
+        ctk.CTkLabel(
+            shell, text="Control Center", font=ctk.CTkFont(size=28, weight="bold"), text_color=p["text"]
+        ).pack(anchor="w", padx=20, pady=(20, 3))
+        ctk.CTkLabel(
+            shell,
+            text="Appearance, Twitch access, diagnostics, privacy, and encrypted storage.",
+            text_color=p["muted"],
+        ).pack(anchor="w", padx=20, pady=(0, 18))
+
+        appearance = ctk.CTkFrame(shell, fg_color=p["surface_alt"], corner_radius=16, border_width=1, border_color=p["border"])
+        appearance.pack(fill="x", padx=20, pady=7)
+        ctk.CTkLabel(
+            appearance, text="Appearance", font=ctk.CTkFont(size=17, weight="bold"), text_color=p["text"]
+        ).pack(anchor="w", padx=16, pady=(14, 8))
+        self.theme_menu = ctk.CTkOptionMenu(
+            appearance,
+            values=list(THEME_PALETTES),
+            fg_color=p["accent"],
+            button_color=p["accent"],
+            button_hover_color=p["accent_hover"],
+            text_color=_contrast_text(p["accent"]),
+            dropdown_fg_color=p["surface"],
+            dropdown_hover_color=p["surface_alt"],
+            dropdown_text_color=p["text"],
+        )
+        self.theme_menu.set(app.theme_name)
+        self.theme_menu.pack(fill="x", padx=16, pady=(0, 10))
+        self.titles_var = BooleanVar(value=app.show_stream_titles)
+        ctk.CTkSwitch(
+            appearance,
+            text="Show saved stream titles",
+            text_color=p["text"],
+            variable=self.titles_var,
+        ).pack(anchor="w", padx=16, pady=(0, 14))
+        ctk.CTkButton(
+            appearance,
+            text="Apply appearance",
+            fg_color=p["accent"],
+            hover_color=p["accent_hover"],
+            text_color=_contrast_text(p["accent"]),
+            command=self._apply,
+        ).pack(fill="x", padx=16, pady=(0, 14))
+
+        actions = (
+            ("Twitch authorization", app.open_twitch_settings, p["accent"], p["accent_hover"]),
+            ("Diagnostics", app.open_diagnostics, p["surface"], p["border"]),
+            ("Change vault password", app.change_history_password, p["surface"], p["border"]),
+            ("Clear encrypted stream history", app.clear_history, p["danger"], p["danger_hover"]),
+        )
+        for title, command, color, hover in actions:
+            ctk.CTkButton(
+                shell,
+                text=title,
+                fg_color=color,
+                hover_color=hover,
+                text_color=_contrast_text(color) if color in {p["accent"], p["danger"]} else p["text"],
+                command=command,
+            ).pack(fill="x", padx=20, pady=6)
+
+    def _apply(self) -> None:
+        self.app.apply_v3_preferences(self.theme_menu.get(), bool(self.titles_var.get()))
+        self.destroy()
+
+
+def _v3_build_ui(self: "TwitchFreedomApp") -> None:
+    prefs = _load_v3_preferences(self.history)
+    self.theme_name = prefs["theme"]
+    self.palette = THEME_PALETTES[self.theme_name]
+    self.show_stream_titles = bool(prefs["show_stream_titles"])
+    self.sidebar_collapsed = bool(prefs["sidebar_collapsed"])
+    self.indicator_frame = 0
+    self.indicator_after_id = None
+    p = self.palette
+    accent_text = _contrast_text(p["accent"])
+    danger_text = _contrast_text(p["danger"])
+
+    self.grid_columnconfigure(0, weight=0, minsize=0)
+    self.grid_columnconfigure(1, weight=1, minsize=0)
+    self.grid_rowconfigure(0, weight=1)
+    self.configure(fg_color=p["root"])
+
+    self.sidebar = ctk.CTkFrame(self, width=250, fg_color=p["panel"], corner_radius=0, border_width=0)
+    self.sidebar.grid(row=0, column=0, sticky="nsew")
+    self.sidebar.grid_propagate(False)
+
+    # Load only the repository logo whose contents match the pinned digest.
+    # The image is deliberately kept small so it reads as a clean brand mark.
+    self.logo_image: PhotoImage | None = None
+    self.logo_label: tk.Label | None = None
+    logo_path = find_verified_logo_path()
+    if logo_path is not None:
+        try:
+            logo_image = PhotoImage(file=str(logo_path))
+            width, height = max(1, logo_image.width()), max(1, logo_image.height())
+            shrink = max(1, int(max((width + 214) // 215, (height + 92) // 93)))
+            if shrink > 1:
+                logo_image = logo_image.subsample(shrink, shrink)
+            self.logo_image = logo_image
+            self.logo_label = tk.Label(
+                self.sidebar,
+                image=self.logo_image,
+                text="",
+                bg=p["panel"],
+                bd=0,
+                highlightthickness=0,
+                padx=0,
+                pady=0,
+            )
+            self.logo_label.pack(anchor="w", padx=18, pady=(18, 4))
+            self.log(f"Verified logo loaded: sha256={EXPECTED_LOGO_SHA256}")
+        except Exception as exc:
+            self.log(f"Verified logo could not be loaded: {exc}")
+
+    sidebar_header = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+    sidebar_header.pack(fill="x", padx=14, pady=(8, 10))
+    ctk.CTkLabel(
+        sidebar_header,
+        text="FOLLOWED STREAMS",
+        font=ctk.CTkFont(size=12, weight="bold"),
+        text_color=p["muted"],
+    ).pack(side="left")
+
+    history_shell = ctk.CTkFrame(
+        self.sidebar, fg_color=p["surface"], corner_radius=18, border_width=1, border_color=p["border"]
+    )
+    history_shell.pack(fill="both", expand=True, padx=10, pady=(0, 112))
+    self.history_frame = ctk.CTkScrollableFrame(
+        history_shell,
+        fg_color="transparent",
+        scrollbar_button_color=p["border"],
+        scrollbar_button_hover_color=p["accent"],
+    )
+    self.history_frame.pack(fill="both", expand=True, padx=6, pady=8)
+
+    self.main = ctk.CTkFrame(self, fg_color=p["root"], corner_radius=0)
+    self.main.grid(row=0, column=1, sticky="nsew", padx=18, pady=18)
+    self.main.grid_columnconfigure(0, weight=1)
+    self.main.grid_rowconfigure(0, weight=1)
+    self.main.grid_rowconfigure(1, weight=0)
+    self.main.grid_rowconfigure(2, weight=0)
+
+    self.topbar = ctk.CTkFrame(
+        self.main, fg_color=p["surface"], corner_radius=20, border_width=1, border_color=p["border"]
+    )
+    self.topbar.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+    self.topbar.grid_columnconfigure(1, weight=1)
+    ctk.CTkLabel(
+        self.topbar, text="Twitch Freedom", font=ctk.CTkFont(size=30, weight="bold"),
+        text_color=p["text"], anchor="w",
+    ).grid(row=0, column=0, columnspan=2, sticky="w", padx=24, pady=16)
+    self.brand_header_label = ctk.CTkLabel(
+        self.topbar, text="TWITCH FREEDOM", font=ctk.CTkFont(size=10, weight="bold"),
+        text_color=p["muted"],
+    )
+    self.brand_header_label.grid(row=0, column=1, sticky="e", padx=22, pady=16)
+    self.topbar.grid_remove()
+
+    self.explore_button = ctk.CTkButton(
+        self.topbar,
+        text="⌕",
+        width=46,
+        height=42,
+        corner_radius=14,
+        font=ctk.CTkFont(size=22),
+        fg_color=p["accent"],
+        hover_color=p["accent_hover"],
+        text_color=accent_text,
+        command=self.open_explore,
+    )
+    self.explore_button.grid(row=0, column=0, rowspan=2, padx=(14, 8), pady=12)
+
+    controls = ctk.CTkFrame(self.topbar, fg_color="transparent")
+    controls.grid(row=0, column=1, rowspan=2, sticky="ew", padx=(0, 14), pady=10)
+    controls.grid_columnconfigure(2, weight=1)
+    self.url_entry = ctk.CTkEntry(
+        controls,
+        height=38,
+        placeholder_text="https://www.twitch.tv/channel",
+        fg_color=p["panel"],
+        border_color=p["border"],
+        text_color=p["text"],
+        placeholder_text_color=p["muted"],
+    )
+    self.url_entry.grid(row=0, column=0, columnspan=7, sticky="ew", pady=(0, 8))
+    self.url_entry.insert(0, DEFAULT_STREAM_URL)
+    self.url_entry.grid_remove()
+
+    option_kwargs = dict(
+        height=34,
+        fg_color=p["accent"],
+        button_color=p["accent"],
+        button_hover_color=p["accent_hover"],
+        text_color=accent_text,
+        dropdown_fg_color=p["surface"],
+        dropdown_hover_color=p["surface_alt"],
+        dropdown_text_color=p["text"],
+    )
+    self.playback_mode_option = ctk.CTkOptionMenu(
+        controls, values=[PLAYBACK_AUDIO_ONLY, PLAYBACK_LOW_VIDEO], command=self.on_playback_mode_changed, **option_kwargs
+    )
+    self.playback_mode_option.set(PLAYBACK_AUDIO_ONLY)
+    self.playback_mode_option.grid(row=1, column=0, sticky="w")
+    self.quality_option = ctk.CTkOptionMenu(
+        controls, values=[QUALITY_AUDIO_ONLY], command=self.on_quality_changed, **option_kwargs
+    )
+    self.quality_option.set(QUALITY_AUDIO_ONLY)
+    self.quality_option.grid(row=1, column=1, sticky="w", padx=(10, 0))
+
+    self.volume_slider = ctk.CTkSlider(
+        controls,
+        from_=0.5,
+        to=3.0,
+        number_of_steps=25,
+        command=self._update_volume_label,
+        progress_color=p["accent"],
+        button_color=p["accent"],
+        button_hover_color=p["accent_hover"],
+    )
+    self.volume_slider.grid(row=1, column=2, sticky="ew", padx=(16, 8))
+    self.volume_label = ctk.CTkLabel(controls, text="Volume 2.0x", width=100, text_color=p["muted"])
+    self.volume_label.grid(row=1, column=3, sticky="e")
+    self.volume_slider.set(2.0)
+    self._update_volume_label(2.0)
+
+    self.start_button = ctk.CTkButton(
+        controls,
+        text="Start Audio",
+        width=108,
+        height=34,
+        fg_color=p["accent"],
+        hover_color=p["accent_hover"],
+        text_color=accent_text,
+        command=self.start_stream,
+    )
+    self.start_button.grid_remove()
+    self.stop_button = ctk.CTkButton(
+        controls,
+        text="Stop",
+        width=74,
+        height=34,
+        fg_color=p["danger"],
+        hover_color=p["danger_hover"],
+        text_color=danger_text,
+        text_color_disabled=p["muted"],
+        state="disabled",
+        command=lambda: self.stop_stream(user_requested=True),
+    )
+    self.stop_button.grid_remove()
+    self.volume_slider.grid_remove()
+    self.volume_label.grid_remove()
+
+    self.content = ctk.CTkFrame(self.main, fg_color="transparent")
+    self.content.grid(row=0, column=0, sticky="nsew")
+    self.content.grid_columnconfigure(0, weight=4)
+    self.content.grid_columnconfigure(1, weight=2)
+    self.content.grid_rowconfigure(0, weight=1)
+
+    self.playback_bar = ctk.CTkFrame(
+        self.main, fg_color=p["surface"], corner_radius=18, border_width=1, border_color=p["border"]
+    )
+    self.playback_bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+    self.playback_bar.grid_columnconfigure(3, weight=1)
+    self.explore_button.grid_remove()
+    self.brand_header_label.lift()
+    self.playback_mode_option.grid_remove()
+    self.quality_option.grid_remove()
+    bottom_option_kwargs = dict(
+        height=34, fg_color=p["accent"], button_color=p["accent"],
+        button_hover_color=p["accent_hover"], text_color=accent_text,
+        dropdown_fg_color=p["surface"], dropdown_hover_color=p["surface_alt"],
+        dropdown_text_color=p["text"],
+    )
+    self.bottom_explore_button = ctk.CTkButton(
+        self.playback_bar, text="⌕", width=46, height=34, corner_radius=12,
+        fg_color=p["accent"], hover_color=p["accent_hover"], text_color=accent_text,
+        command=self.open_explore,
+    )
+    self.bottom_explore_button.grid(row=0, column=0, padx=(10, 6), pady=10)
+    self.bottom_playback_mode_option = ctk.CTkOptionMenu(
+        self.playback_bar, values=[PLAYBACK_AUDIO_ONLY, PLAYBACK_LOW_VIDEO],
+        command=self.on_playback_mode_changed, **bottom_option_kwargs,
+    )
+    self.bottom_playback_mode_option.set(PLAYBACK_AUDIO_ONLY)
+    self.bottom_playback_mode_option.grid(row=0, column=1, padx=6, pady=10)
+    self.bottom_quality_option = ctk.CTkOptionMenu(
+        self.playback_bar, values=[QUALITY_AUDIO_ONLY], command=self.on_quality_changed,
+        **bottom_option_kwargs,
+    )
+    self.bottom_quality_option.set(QUALITY_AUDIO_ONLY)
+    self.bottom_quality_option.grid(row=0, column=2, padx=6, pady=10)
+    self.bottom_volume_slider = ctk.CTkSlider(
+        self.playback_bar, from_=0.5, to=3.0, number_of_steps=25,
+        command=self._update_volume_label, progress_color=p["accent"],
+        button_color=p["accent"], button_hover_color=p["accent_hover"],
+    )
+    self.bottom_volume_slider.grid(row=0, column=3, sticky="ew", padx=(16, 8), pady=10)
+    self.bottom_volume_slider.set(2.0)
+    self.volume_slider = self.bottom_volume_slider
+    self.volume_label = ctk.CTkLabel(self.playback_bar, text="Volume 2.0x", width=90, text_color=p["text"])
+    self.volume_label.grid(row=0, column=4, sticky="e", pady=10)
+    self.start_button = ctk.CTkButton(
+        self.playback_bar, text="Start Audio", width=112, height=34,
+        fg_color=p["accent"], hover_color=p["accent_hover"], text_color=accent_text,
+        command=self.start_stream,
+    )
+    self.start_button.grid(row=0, column=5, padx=(14, 8), pady=10)
+    self.stop_button = ctk.CTkButton(
+        self.playback_bar, text="Stop", width=78, height=34,
+        fg_color=p["danger"], hover_color=p["danger_hover"], text_color=danger_text,
+        text_color_disabled=p["muted"], state="disabled",
+        command=lambda: self.stop_stream(user_requested=True),
+    )
+    self.stop_button.grid(row=0, column=6, padx=(0, 10), pady=10)
+    self.playback_toggle_button = ctk.CTkButton(
+        self.playback_bar, text="Hide", width=56, height=30,
+        fg_color=p["surface_alt"], hover_color=p["border"], text_color=p["text"],
+        command=self.toggle_playback_controls,
+    )
+    self.playback_toggle_button.grid(row=0, column=7, padx=(0, 10), pady=10)
+    self.playback_mode_option = self.bottom_playback_mode_option
+    self.quality_option = self.bottom_quality_option
+    self.url_entry = ctk.CTkEntry(
+        self.playback_bar,
+        height=38,
+        placeholder_text="https://www.twitch.tv/channel",
+        fg_color=p["panel"],
+        border_color=p["border"],
+        text_color=p["text"],
+        placeholder_text_color=p["muted"],
+    )
+    self.url_entry.grid(row=1, column=0, columnspan=8, sticky="ew", padx=10, pady=(0, 10))
+    self.url_entry.insert(0, DEFAULT_STREAM_URL)
+    self.url_entry.grid_remove()
+
+    self.video_shell = ctk.CTkFrame(
+        self.content, fg_color=p["surface"], corner_radius=24, border_width=1, border_color=p["border"]
+    )
+    self.video_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+    self.video_shell.grid_columnconfigure(0, weight=1)
+    self.video_shell.grid_rowconfigure(1, weight=1)
+
+    self.video_header = ctk.CTkFrame(self.video_shell, fg_color="transparent")
+    self.video_header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 7))
+    self.video_header.grid_columnconfigure(0, weight=1)
+    self.video_title_label = ctk.CTkLabel(self.video_header, text="", width=1, text_color=p["text"])
+    self.spinner_label = ctk.CTkLabel(
+        self.video_header, text="◌", width=24, font=ctk.CTkFont(size=18), text_color=p["muted"]
+    )
+    self.spinner_label.grid(row=0, column=1, sticky="e", padx=(0, 7))
+    self.status_label = ctk.CTkLabel(
+        self.video_header, text="Ready", font=ctk.CTkFont(size=12, weight="bold"), text_color=p["success"]
+    )
+    self.status_label.grid(row=0, column=2, sticky="e")
+    self.now_playing_label = ctk.CTkLabel(
+        self.video_header,
+        text="No active stream",
+        font=ctk.CTkFont(size=10),
+        text_color=p["muted"],
+        anchor="center",
+    )
+    self.now_playing_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+    self.status_card = self.video_header
+
+    self.video_panel = ctk.CTkFrame(
+        self.video_shell, fg_color=p["panel"], corner_radius=16, border_width=1, border_color=p["border"]
+    )
+    self.video_panel.grid(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
+    self.video_panel.grid_columnconfigure(0, weight=1)
+    self.video_panel.grid_rowconfigure(1, weight=1)
+    self.video_status_label = ctk.CTkLabel(
+        self.video_panel,
+        text=video_ready_message(),
+        font=ctk.CTkFont(size=11),
+        text_color=p["muted"],
+        wraplength=760,
+        justify="left",
+    )
+    self.video_status_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(13, 6))
+    self.video_surface = ctk.CTkFrame(self.video_panel, fg_color="#000000", corner_radius=11)
+    self.video_surface.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 9))
+    self.video_surface.bind("<Double-Button-1>", self.toggle_ffplay_fullscreen)
+    self.video_surface.bind("<Configure>", self.resize_docked_video)
+    placeholder = ctk.CTkLabel(
+        self.video_surface,
+        text="Double-click for fullscreen" if supports_x11_video_docking() else "FFplay opens in a native window",
+        text_color=p["muted"],
+    )
+    placeholder.pack(expand=True)
+    placeholder.bind("<Double-Button-1>", self.toggle_ffplay_fullscreen)
+
+    self.video_hint_label = ctk.CTkLabel(
+        self.video_panel,
+        text="",
+        font=ctk.CTkFont(size=10),
+        text_color=p["muted"],
+    )
+    self.video_hint_label.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
+    self.ffplay_fullscreen_button = ctk.CTkButton(
+        self.video_panel,
+        text="Fullscreen",
+        height=32,
+        fg_color=p["surface_alt"],
+        hover_color=p["border"],
+        text_color=p["text"],
+        command=self.toggle_ffplay_fullscreen,
+    )
+    self.ffplay_fullscreen_button.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+    self.pop_video_button = None
+    self.stream_health_label = ctk.CTkLabel(
+        self.video_shell,
+        text="Health: Idle",
+        font=ctk.CTkFont(size=11, weight="bold"),
+        text_color=p["muted"],
+        anchor="w",
+    )
+    self.stream_health_label.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 14))
+    self.bind("<Escape>", self.exit_embedded_fullscreen)
+
+    self.side_stack = ctk.CTkFrame(self.content, fg_color="transparent")
+    self.side_stack.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    self.side_stack.grid_columnconfigure(0, weight=1)
+    self.side_stack.grid_rowconfigure(0, weight=1)
+
+    chat_shell = ctk.CTkFrame(
+        self.side_stack, fg_color=p["surface"], corner_radius=24, border_width=1, border_color=p["border"]
+    )
+    chat_shell.grid(row=0, column=0, sticky="nsew")
+    chat_shell.grid_columnconfigure(0, weight=1)
+    chat_shell.grid_rowconfigure(2, weight=1)
+    chat_header = ctk.CTkFrame(chat_shell, fg_color="transparent")
+    chat_header.grid(row=0, column=0, sticky="ew", padx=14, pady=(16, 8))
+    chat_header.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(
+        chat_header, text="CHAT", font=ctk.CTkFont(size=16, weight="bold"), text_color=p["text"]
+    ).grid(row=0, column=0, sticky="w")
+    self.chat_status_label = ctk.CTkLabel(
+        chat_header, text="Disconnected", font=ctk.CTkFont(size=10, weight="bold"), text_color=p["muted"]
+    )
+    self.chat_status_label.grid(row=0, column=1, sticky="e")
+
+    chat_actions = ctk.CTkFrame(chat_shell, fg_color="transparent")
+    chat_actions.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
+    ctk.CTkButton(
+        chat_actions,
+        text="Connect",
+        width=72,
+        fg_color=p["accent"],
+        hover_color=p["accent_hover"],
+        text_color=accent_text,
+        command=self.connect_chat,
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        chat_actions,
+        text="Disconnect",
+        width=86,
+        fg_color=p["surface_alt"],
+        hover_color=p["border"],
+        text_color=p["text"],
+        command=lambda: self.disconnect_chat(user_requested=True),
+    ).pack(side="left", padx=(0, 6))
+    ctk.CTkButton(
+        chat_actions,
+        text="↗",
+        width=42,
+        fg_color=p["surface_alt"],
+        hover_color=p["border"],
+        text_color=p["text"],
+        command=self.open_chat_popout,
+    ).pack(side="right")
+
+    self.chat_box = ctk.CTkTextbox(
+        chat_shell, fg_color=p["panel"], text_color=p["text"], border_width=0, wrap="word"
+    )
+    self.chat_box.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
+    self.chat_box.insert("end", "Open Settings to authorize Twitch chat, or use the browser popout.\n")
+    self.chat_line_count = 1
+    self.chat_box.configure(state="disabled")
+    chat_send = ctk.CTkFrame(chat_shell, fg_color="transparent")
+    chat_send.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+    chat_send.grid_columnconfigure(0, weight=1)
+    self.chat_entry = ctk.CTkEntry(
+        chat_send,
+        placeholder_text="Send a chat message…",
+        height=34,
+        fg_color=p["panel"],
+        border_color=p["border"],
+        text_color=p["text"],
+        placeholder_text_color=p["muted"],
+    )
+    self.chat_entry.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+    self.chat_entry.bind("<Return>", lambda _event: self.send_chat_message())
+    ctk.CTkButton(
+        chat_send,
+        text="Send",
+        width=58,
+        height=34,
+        fg_color=p["accent"],
+        hover_color=p["accent_hover"],
+        text_color=accent_text,
+        command=self.send_chat_message,
+    ).grid(row=0, column=1)
+
+    self.brand_footer = ctk.CTkFrame(self.main, fg_color="transparent")
+    self.brand_footer.place_forget()
+    self.brand_footer.grid_columnconfigure(0, weight=1)
+    ctk.CTkLabel(
+        self.brand_footer,
+        text="TWITCH FREEDOM",
+        font=ctk.CTkFont(size=10, weight="bold"),
+        text_color=p["muted"],
+    ).grid(row=0, column=0, sticky="e", padx=4)
+
+    # Left-side floating cluster. The help control remains to the left;
+    # add sits above settings, as requested.
+    self.floating_tools = ctk.CTkFrame(
+        self, width=112, height=94, fg_color=p["surface_alt"], corner_radius=18,
+        border_width=1, border_color=p["border"]
+    )
+    self.floating_tools.grid_propagate(False)
+    self.floating_tools.place(x=14, rely=1.0, y=-14, anchor="sw")
+    self.help_button = ctk.CTkButton(
+        self.floating_tools,
+        text="?",
+        width=34,
+        height=34,
+        corner_radius=13,
+        fg_color="transparent",
+        hover_color=p["border"],
+        text_color=p["text"],
+        command=self.open_help,
+    )
+    self.help_button.pack(side="left", padx=(7, 2), pady=7)
+    stack = ctk.CTkFrame(self.floating_tools, fg_color="transparent")
+    stack.pack(side="left", padx=(2, 6), pady=7)
+    self.add_stream_button = ctk.CTkButton(
+        stack,
+        text="+",
+        width=48,
+        height=34,
+        corner_radius=13,
+        font=ctk.CTkFont(size=20),
+        fg_color="transparent",
+        hover_color=p["border"],
+        text_color=p["text"],
+        command=self.toggle_stream_url,
+    )
+    self.add_stream_button.pack(pady=(0, 5))
+    self.settings_button = ctk.CTkButton(
+        stack,
+        text="☷",
+        width=48,
+        height=34,
+        corner_radius=13,
+        font=ctk.CTkFont(size=19),
+        fg_color=p["accent"],
+        hover_color=p["accent_hover"],
+        text_color=accent_text,
+        command=self.open_settings,
+    )
+    self.settings_button.pack()
+
+    # Persistent drawer button and tiny brand badge. These are root-level,
+    # so they remain visible after the sidebar is removed from the grid.
+    self.drawer_button = ctk.CTkButton(
+        self,
+        text="☰",
+        width=42,
+        height=38,
+        corner_radius=12,
+        fg_color=p["surface_alt"],
+        hover_color=p["border"],
+        text_color=p["text"],
+        command=self.toggle_sidebar,
+    )
+    self.drawer_button.place(x=12, y=12)
+    self.logo_button = ctk.CTkButton(
+        self,
+        text="TF",
+        width=34,
+        height=30,
+        corner_radius=10,
+        font=ctk.CTkFont(size=10, weight="bold"),
+        fg_color="transparent",
+        hover_color=p["surface_alt"],
+        text_color=p["muted"],
+        command=self.toggle_sidebar,
+    )
+    self.logo_button.place(x=57, y=16)
+    self.playback_controls_collapsed = False
+    self.playback_compact_controls = ctk.CTkFrame(
+        self, fg_color=p["surface"], corner_radius=16, border_width=1, border_color=p["border"],
+    )
+    self.compact_start_button = ctk.CTkButton(
+        self.playback_compact_controls, text="Start", width=72, height=38,
+        fg_color=p["accent"], hover_color=p["accent_hover"], text_color=accent_text,
+        command=self.start_stream,
+    )
+    self.compact_start_button.pack(side="left", padx=(7, 4), pady=7)
+    self.compact_stop_button = ctk.CTkButton(
+        self.playback_compact_controls, text="Stop", width=68, height=38,
+        fg_color=p["danger"], hover_color=p["danger_hover"], text_color=danger_text,
+        command=lambda: self.stop_stream(user_requested=True),
+    )
+    self.compact_stop_button.pack(side="left", padx=4, pady=7)
+    self.compact_show_button = ctk.CTkButton(
+        self.playback_compact_controls, text="Show", width=68, height=38,
+        fg_color=p["surface_alt"], hover_color=p["border"], text_color=p["text"],
+        command=self.toggle_playback_controls,
+    )
+    self.compact_show_button.pack(side="left", padx=(4, 7), pady=7)
+    self.playback_compact_controls.place_forget()
+
+    self._apply_v3_sidebar_layout(open_sidebar=not self.sidebar_collapsed)
+    self._animate_v3_indicator()
+
+
+def _apply_v3_sidebar_layout(self: "TwitchFreedomApp", open_sidebar: bool) -> None:
+    self.sidebar_collapsed = not bool(open_sidebar)
+    # Explicitly clear the column minimum and span main across both columns.
+    # This avoids the old 78px/first-letter rail remaining after collapse.
+    self.grid_columnconfigure(0, weight=0, minsize=0)
+    self.grid_columnconfigure(1, weight=1, minsize=0)
+    if open_sidebar:
+        self.sidebar.configure(width=250)
+        self.sidebar.grid(row=0, column=0, sticky="nsew")
+        self.main.grid_configure(row=0, column=1, columnspan=1, sticky="nsew", padx=18, pady=18)
+        self.refresh_history(check_online=False)
+        if self.logo_label is not None:
+            self.logo_label.pack(anchor="w", padx=18, pady=(18, 4))
+        self.logo_button.place_forget()
+    else:
+        self.sidebar.grid_remove()
+        self.sidebar.configure(width=1)
+        self.main.grid_configure(
+            row=0, column=0, columnspan=2, sticky="nsew", padx=(104, 18), pady=18
+        )
+        if self.logo_label is not None:
+            self.logo_label.pack_forget()
+        self.logo_button.place(x=57, y=16)
+    self.drawer_button.lift()
+    self.logo_button.lift()
+    self.floating_tools.lift()
+    self.playback_compact_controls.lift()
+
+
+def _toggle_playback_controls(self: "TwitchFreedomApp") -> None:
+    if not self.playback_controls_collapsed:
+        self.playback_controls_collapsed = True
+        self.playback_bar.grid_remove()
+        self.playback_compact_controls.place(relx=1.0, rely=1.0, x=-18, y=-18, anchor="se")
+        self.playback_compact_controls.lift()
+        self.playback_toggle_button.configure(text="Show")
+    else:
+        self.playback_controls_collapsed = False
+        self.playback_compact_controls.place_forget()
+        self.playback_bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.playback_toggle_button.configure(text="Hide")
+
+
+def _floating_playback_action(self: "TwitchFreedomApp") -> None:
+    if self.is_streaming:
+        self.stop_stream(user_requested=True)
+    else:
+        self.start_stream()
+
+
+def _v3_toggle_sidebar(self: "TwitchFreedomApp") -> None:
+    if self.fullscreen_video:
+        return
+    self._apply_v3_sidebar_layout(open_sidebar=self.sidebar_collapsed)
+    _save_v3_preferences(self)
+
+
+def _v3_refresh_history(self: "TwitchFreedomApp", check_online: bool = True) -> None:
+    for child in self.history_frame.winfo_children():
+        child.destroy()
+    records = self.history.list_streams()
+    if self.sidebar_collapsed:
+        if check_online:
+            self.refresh_online_statuses(records)
+        return
+    if not records:
+        p = self.palette
+        empty = ctk.CTkFrame(
+            self.history_frame, fg_color=p["surface_alt"], corner_radius=14, border_width=1, border_color=p["border"]
+        )
+        empty.pack(fill="x", padx=2, pady=4)
+        ctk.CTkLabel(
+            empty, text="No saved streams yet", font=ctk.CTkFont(size=13, weight="bold"), text_color=p["text"]
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        ctk.CTkLabel(
+            empty, text="Saved streams are encrypted.", font=ctk.CTkFont(size=11), text_color=p["muted"]
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+    else:
+        indexed = list(enumerate(records))
+        def key(item: tuple[int, StreamRecord]) -> tuple[int, int]:
+            index, record = item
+            channel = twitch_channel_from_url(record.url) or ""
+            state = self.online_statuses.get(channel.lower())
+            return (0 if state is True else 2 if state is False else 1, index)
+        for _index, record in sorted(indexed, key=key):
+            channel = twitch_channel_from_url(record.url) or ""
+            V3StreamCard(
+                self.history_frame,
+                record,
+                self,
+                compact=True,
+                online_status=self.online_statuses.get(channel.lower()),
+            ).pack(fill="x", padx=2, pady=6)
+    if check_online:
+        self.refresh_online_statuses(records)
+
+
+def _v3_animate_indicator(self: "TwitchFreedomApp") -> None:
+    frames = ("◜", "◝", "◞", "◟")
+    if hasattr(self, "spinner_label") and self.spinner_label.winfo_exists():
+        if self.is_streaming or self.is_video_popped:
+            self.spinner_label.configure(
+                text=frames[self.indicator_frame % len(frames)], text_color=self.palette["success"]
+            )
+            self.indicator_frame += 1
+        else:
+            self.spinner_label.configure(text="◌", text_color=self.palette["muted"])
+    self.indicator_after_id = self.after(140, self._animate_v3_indicator)
+
+
+def _v3_open_settings(self: "TwitchFreedomApp") -> None:
+    V3ControlCenter(self)
+
+
+def _v3_open_twitch_settings(self: "TwitchFreedomApp") -> None:
+    dialog = SettingsDialog(self, self.history)
+    self.wait_window(dialog)
+
+
+def _v3_open_help(self: "TwitchFreedomApp") -> None:
+    V3HelpDialog(self)
+
+
+def _v3_apply_preferences(self: "TwitchFreedomApp", theme_name: str, show_titles: bool) -> None:
+    if theme_name not in THEME_PALETTES:
+        theme_name = "Midnight Glass"
+    theme_changed = theme_name != self.theme_name
+    self.theme_name = theme_name
+    self.palette = THEME_PALETTES[theme_name]
+    self.show_stream_titles = bool(show_titles)
+    _save_v3_preferences(self)
+    if theme_changed:
+        messagebox.showinfo(
+            "Theme saved",
+            "The selected theme and contrast-correct button text are encrypted in your preferences and apply on the next launch.",
+        )
+    else:
+        self.refresh_history(check_online=False)
+
+
+def _v3_set_stream_health(self: "TwitchFreedomApp", state: str, detail: str = "") -> None:
+    p = self.palette
+    colors = {
+        "Idle": p["muted"], "Healthy": p["success"], "Buffering": p["warning"],
+        "Recovering": p["accent"], "Stopped": p["danger"],
+    }
+    previous = getattr(self, "stream_health", "")
+    self.stream_health = state
+    if hasattr(self, "compact_start_button"):
+        self.compact_start_button.configure(text="Playing" if self.is_streaming else "Start")
+    message = f"Health: {state}" + (f" - {detail}" if detail else "")
+    if hasattr(self, "stream_health_label"):
+        self.stream_health_label.configure(text=message, text_color=colors.get(state, p["muted"]))
+    if previous != state or detail:
+        self.log(message)
+
+
+def _v3_fullscreen_layout(self: "TwitchFreedomApp", enabled: bool) -> None:
+    p = self.palette
+    if enabled:
+        self.sidebar.grid_remove()
+        self.drawer_button.place_forget()
+        self.logo_button.place_forget()
+        self.floating_tools.place_forget()
+        self.topbar.grid_remove()
+        self.brand_header_label.grid_remove()
+        self.brand_footer.place_forget()
+        self.playback_bar.grid_remove()
+        self.playback_compact_controls.place_forget()
+        self.side_stack.grid_remove()
+        self.video_header.grid_remove()
+        self.video_status_label.grid_remove()
+        self.video_hint_label.grid_remove()
+        self.ffplay_fullscreen_button.grid_remove()
+        self.stream_health_label.grid_remove()
+        self.main.grid_configure(row=0, column=0, columnspan=2, sticky="nsew", padx=0, pady=0)
+        self.content.grid_configure(row=0, column=0, sticky="nsew")
+        self.content.grid_columnconfigure(0, weight=1)
+        self.content.grid_columnconfigure(1, weight=0)
+        self.video_shell.grid_configure(row=0, column=0, sticky="nsew", padx=0)
+        self.video_shell.configure(fg_color="#000000", corner_radius=0, border_width=0)
+        self.video_panel.grid_configure(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self.video_panel.configure(fg_color="#000000", corner_radius=0, border_width=0)
+        self.video_surface.grid_configure(row=0, column=0, sticky="nsew", padx=0, pady=0)
+        self.video_surface.configure(corner_radius=0)
+    else:
+        self.main.grid_rowconfigure(0, weight=1)
+        self._apply_v3_sidebar_layout(open_sidebar=not self.sidebar_collapsed)
+        self.drawer_button.place(x=12, y=12)
+        self.logo_button.place(x=57, y=16)
+        self.floating_tools.place(x=14, rely=1.0, y=-14, anchor="sw")
+        self.topbar.grid_remove()
+        self.brand_header_label.grid_remove()
+        if self.playback_controls_collapsed:
+            self.playback_bar.grid_remove()
+            self.playback_compact_controls.place(relx=1.0, rely=1.0, x=-18, y=-18, anchor="se")
+            self.playback_compact_controls.lift()
+        elif not self.playback_bar.winfo_ismapped():
+            self.playback_bar.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        self.content.grid_configure(row=0, column=0, sticky="nsew")
+        self.content.grid_columnconfigure(0, weight=4)
+        self.content.grid_columnconfigure(1, weight=2)
+        self.video_shell.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 10))
+        self.video_shell.configure(fg_color=p["surface"], corner_radius=24, border_width=1)
+        self.video_header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 7))
+        self.video_panel.grid_configure(row=1, column=0, sticky="nsew", padx=14, pady=(0, 8))
+        self.video_panel.configure(fg_color=p["panel"], corner_radius=16, border_width=1)
+        self.video_status_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(13, 6))
+        self.video_surface.grid_configure(row=1, column=0, sticky="nsew", padx=12, pady=(0, 9))
+        self.video_surface.configure(corner_radius=11)
+        self.video_hint_label.grid(row=2, column=0, sticky="ew", padx=14, pady=(0, 8))
+        self.ffplay_fullscreen_button.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+        self.stream_health_label.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 14))
+        self.side_stack.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+    self.update_idletasks()
+
+
+_original_on_close_v3 = TwitchFreedomApp.on_close
+
+
+def _v3_on_close(self: "TwitchFreedomApp") -> None:
+    if getattr(self, "indicator_after_id", None) is not None:
+        try:
+            self.after_cancel(self.indicator_after_id)
+        except Exception:
+            pass
+        self.indicator_after_id = None
+    _original_on_close_v3(self)
+
+
+# Install v3 UI methods before the application is instantiated.
+StreamCard = V3StreamCard
+TwitchFreedomApp._build_ui = _v3_build_ui
+TwitchFreedomApp._apply_v3_sidebar_layout = _apply_v3_sidebar_layout
+TwitchFreedomApp.toggle_sidebar = _v3_toggle_sidebar
+TwitchFreedomApp.toggle_playback_controls = _toggle_playback_controls
+TwitchFreedomApp._floating_playback_action = _floating_playback_action
+TwitchFreedomApp.refresh_history = _v3_refresh_history
+TwitchFreedomApp._animate_v3_indicator = _v3_animate_indicator
+TwitchFreedomApp.open_settings = _v3_open_settings
+TwitchFreedomApp.open_twitch_settings = _v3_open_twitch_settings
+TwitchFreedomApp.open_help = _v3_open_help
+TwitchFreedomApp.apply_v3_preferences = _v3_apply_preferences
+TwitchFreedomApp.set_stream_health = _v3_set_stream_health
+TwitchFreedomApp._set_video_only_fullscreen = _v3_fullscreen_layout
+TwitchFreedomApp.on_close = _v3_on_close
 
 
 def unlock_history(root: ctk.CTk) -> EncryptedHistoryStore | None:

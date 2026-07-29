@@ -1,0 +1,133 @@
+name: Build Twitch Freedom executables
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: twitchfreedom-linux-x86_64
+            ffmpeg_url: https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+          - os: macos-14
+            artifact: twitchfreedom-macos-arm64
+            ffmpeg_url: build-from-official-github-source
+          - os: windows-2025
+            artifact: twitchfreedom-windows-x86_64
+            ffmpeg_url: https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install latest locked runtime dependencies and builder
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade -r requirements.txt pyinstaller
+
+      - name: Build bundled Streamlink CLI
+        run: |
+          python -m PyInstaller --clean --noconfirm --onefile --name streamlink \
+            --collect-all streamlink --collect-all streamlink_cli scripts/streamlink_entry.py
+
+      - name: Download FFmpeg bundle
+        shell: bash
+        run: |
+          mkdir -p package/bin
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+            brew install sdl2
+            git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git ffmpeg-source
+            cd ffmpeg-source
+            ./configure --prefix="$GITHUB_WORKSPACE/package" --disable-debug \
+              --disable-doc --disable-ffmpeg --disable-ffprobe --disable-shared \
+              --enable-static --enable-ffplay --enable-sdl2
+            make -j"$(sysctl -n hw.ncpu)"
+            make install
+            cp ffplay "$GITHUB_WORKSPACE/package/bin/ffplay"
+            cd "$GITHUB_WORKSPACE"
+          else
+            curl --fail --location --retry 4 --proto '=https' --tlsv1.2 \
+              "${{ matrix.ffmpeg_url }}" --output ffmpeg-download
+            asset_name="$(basename "${{ matrix.ffmpeg_url }}")"
+            expected_digest="$(curl --fail --silent --show-error \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest \
+              | jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest' \
+              | sed 's/^sha256://')"
+            test -n "$expected_digest" && [[ "$expected_digest" != "null" ]] || {
+              echo "GitHub did not provide a SHA256 digest for $asset_name" >&2
+              exit 1
+            }
+            actual_digest="$(sha256sum ffmpeg-download 2>/dev/null | awk '{print $1}' || shasum -a 256 ffmpeg-download | awk '{print $1}')"
+            test "$actual_digest" = "$expected_digest" || {
+              echo "FFmpeg SHA256 mismatch: expected $expected_digest, got $actual_digest" >&2
+              exit 1
+            }
+            echo "Verified GitHub FFmpeg asset SHA256: $actual_digest"
+          fi
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            tar -xJf ffmpeg-download
+            find . -type f -name ffplay -exec cp {} package/bin/ffplay \;
+          else
+            if [[ "${{ runner.os }}" == "Windows" ]]; then
+              unzip -q ffmpeg-download -d ffmpeg-unpacked
+              find ffmpeg-unpacked -type f -name ffplay.exe -exec cp {} package/bin/ffplay.exe \;
+            fi
+          fi
+          test -s package/bin/ffplay${{ runner.os == 'Windows' && '.exe' || '' }}
+          sha256sum package/bin/ffplay* 2>/dev/null || shasum -a 256 package/bin/ffplay*
+          chmod +x package/bin/ffplay 2>/dev/null || true
+
+      - name: Add bundled Streamlink and application assets
+        shell: bash
+        run: |
+          cp dist/streamlink package/bin/streamlink${{ runner.os == 'Windows' && '.exe' || '' }}
+          cp logo.png package/logo.png
+          chmod +x package/bin/streamlink 2>/dev/null || true
+
+      - name: Build application executable
+        run: |
+          python -m PyInstaller --clean --noconfirm --onefile --windowed \
+            --name TwitchFreedom --add-data "logo.png:." \
+            --add-binary "package/bin/streamlink${{ runner.os == 'Windows' && '.exe' || '' }}:bin" \
+            --add-binary "package/bin/ffplay${{ runner.os == 'Windows' && '.exe' || '' }}:bin" main.py
+
+      - name: Package and checksum
+        shell: bash
+        run: |
+          mkdir -p release
+          if [[ "${{ runner.os }}" == "Windows" ]]; then cp dist/TwitchFreedom.exe release/; else cp dist/TwitchFreedom release/; fi
+          (cd release && sha256sum * > SHA256SUMS.txt 2>/dev/null || shasum -a 256 * > SHA256SUMS.txt)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
