@@ -2,10 +2,8 @@ name: Apply chat and video compatibility fix
 
 on:
   push:
-    branches:
-      - agent/fix-chat-and-60fps-playback
-    paths:
-      - .github/workflows/apply-chat-video-fix.yml
+    branches: [agent/fix-chat-and-60fps-playback]
+    paths: [.github/workflows/apply-chat-video-fix.yml]
   workflow_dispatch:
 
 permissions:
@@ -15,7 +13,191 @@ jobs:
   patch:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-         
+          ref: agent/fix-chat-and-60fps-playback
+
+      - name: Patch main.py
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path('main.py')
+          text = path.read_text(encoding='utf-8')
+
+          text = text.replace(
+              'CHAT_SOCKET_TIMEOUT_SECONDS = 2.0\nCHAT_SEND_CONFIRM_SECONDS = 20.0',
+              'CHAT_SOCKET_TIMEOUT_SECONDS = 2.0\nCHAT_RECONNECT_BASE_SECONDS = 1.0\nCHAT_RECONNECT_MAX_SECONDS = 30.0\nCHAT_STABLE_RESET_SECONDS = 60.0\nCHAT_SEND_CONFIRM_SECONDS = 20.0',
+          )
+
+          chat_pattern = re.compile(
+              r'    def run\(self\) -> None:\n.*?\n    def send_chat_message\(self, message: str\) -> bool:',
+              re.DOTALL,
+          )
+          chat_replacement = '''    def run(self) -> None:
+        reconnect_delay = CHAT_RECONNECT_BASE_SECONDS
+        while not self.stop_event.is_set():
+            sock: ssl.SSLSocket | None = None
+            connected_at = 0.0
+            reconnect_requested = False
+            try:
+                context = ssl.create_default_context()
+                raw_sock = socket.create_connection((TWITCH_IRC_HOST, TWITCH_IRC_PORT), timeout=10)
+                sock = context.wrap_socket(raw_sock, server_hostname=TWITCH_IRC_HOST)
+                self.sock = sock
+                sock.settimeout(CHAT_SOCKET_TIMEOUT_SECONDS)
+
+                self._send(f"PASS {self.token}")
+                self._send(f"NICK {self.nick}")
+                self._send("CAP REQ :twitch.tv/tags twitch.tv/commands")
+                self._send(f"JOIN #{self.channel}")
+                connected_at = time.monotonic()
+                self.event_queue.put(("chat_status", f"Connected to #{self.channel}"))
+
+                buffer = ""
+                while not self.stop_event.is_set():
+                    try:
+                        chunk = sock.recv(4096)
+                    except socket.timeout:
+                        continue
+
+                    if not chunk:
+                        raise ConnectionError("Twitch closed the chat connection.")
+
+                    buffer += chunk.decode("utf-8", errors="replace")
+                    lines = buffer.split("\\r\\n")
+                    buffer = lines.pop()
+
+                    for line in lines:
+                        if not line:
+                            continue
+                        if line.startswith("PING"):
+                            self._send(line.replace("PING", "PONG", 1))
+                            continue
+                        if line == "RECONNECT" or line.endswith(" RECONNECT"):
+                            reconnect_requested = True
+                            raise ConnectionError("Twitch requested a chat reconnect.")
+                        parsed = parse_privmsg(line)
+                        if parsed:
+                            user, message = parsed
+                            clean_user = sanitize_chat_user(user)
+                            clean_message = sanitize_chat_message(message)
+                            if clean_message:
+                                self.event_queue.put(("chat_message", json.dumps({"user": clean_user, "message": clean_message})))
+                        elif "Login authentication failed" in line:
+                            self.event_queue.put(("chat_status", "Chat auth failed. Check Settings."))
+                            return
+                        elif " NOTICE " in line and " :" in line:
+                            self.event_queue.put(("chat_status", "Chat notice: " + line.rsplit(" :", 1)[-1]))
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    break
+                if connected_at and time.monotonic() - connected_at >= CHAT_STABLE_RESET_SECONDS:
+                    reconnect_delay = CHAT_RECONNECT_BASE_SECONDS
+                reason = sanitize_text(str(exc), max_chars=240) or "connection ended"
+                self.event_queue.put(("chat_status", f"Chat reconnecting in {reconnect_delay:.0f}s: {reason}"))
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                self.sock = None
+
+            if self.stop_event.is_set():
+                break
+            wait_seconds = 0.0 if reconnect_requested else reconnect_delay
+            if self.stop_event.wait(wait_seconds):
+                break
+            reconnect_delay = min(max(CHAT_RECONNECT_BASE_SECONDS, reconnect_delay * 2), CHAT_RECONNECT_MAX_SECONDS)
+
+        if not self.stop_event.is_set():
+            self.event_queue.put(("chat_status", "Chat disconnected."))
+
+    def send_chat_message(self, message: str) -> bool:'''
+          text, count = chat_pattern.subn(chat_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'chat reader patch count={count}')
+
+          audio_pattern = re.compile(
+              r'    def _ffplay_command\(self, volume: float\) -> list\[str\]:\n.*?\n    def _ffplay_video_command',
+              re.DOTALL,
+          )
+          audio_replacement = '''    def _ffplay_command(self, volume: float) -> list[str]:
+        return [
+            resolve_command("ffplay") or "ffplay",
+            "-loglevel",
+            "warning",
+            "-autoexit",
+            "-nodisp",
+            "-af",
+            f"volume={volume:.1f}",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-analyzeduration",
+            "10M",
+            "-probesize",
+            "10M",
+            "-max_probe_packets",
+            "10000",
+            "-sync",
+            "ext",
+            "-framedrop",
+            "-",
+        ]
+
+    def _ffplay_video_command'''
+          text, count = audio_pattern.subn(audio_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'audio ffplay patch count={count}')
+
+          video_pattern = re.compile(
+              r'    def _ffplay_video_command\(self, volume: float, window_title: str\) -> list\[str\]:\n.*?\n    def _embedded_ffplay_command',
+              re.DOTALL,
+          )
+          video_replacement = '''    def _ffplay_video_command(self, volume: float, window_title: str) -> list[str]:
+        return [
+            resolve_command("ffplay") or "ffplay",
+            "-loglevel",
+            "warning",
+            "-autoexit",
+            "-window_title",
+            window_title,
+            "-af",
+            f"volume={volume:.1f}",
+            "-fflags",
+            "+genpts+discardcorrupt",
+            "-analyzeduration",
+            "10M",
+            "-probesize",
+            "10M",
+            "-max_probe_packets",
+            "10000",
+            "-sync",
+            "ext",
+            "-framedrop",
+            "-",
+        ]
+
+    def _embedded_ffplay_command'''
+          text, count = video_pattern.subn(video_replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'video ffplay patch count={count}')
+
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Validate
+        run: |
+          python -m py_compile main.py
+          grep -q 'CHAT_RECONNECT_MAX_SECONDS' main.py
+          ! grep -A35 'def _ffplay_video_command' main.py | grep -q 'mpegts'
+
+      - name: Commit patch
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add main.py
+          git commit -m 'fix chat reconnect and 60fps playback' || exit 0
+          git push
