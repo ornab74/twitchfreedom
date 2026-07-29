@@ -1,0 +1,21 @@
+name: Apply chat and video compatibility fix
+
+on:
+  push:
+    branches:
+      - agent/fix-chat-and-60fps-playback
+    paths:
+      - .github/workflows/apply-chat-video-fix.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+         
